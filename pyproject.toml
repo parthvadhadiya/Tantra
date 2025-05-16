@@ -1,0 +1,25 @@
+[project]
+name = "tantra"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "parthvadhadiya",email = "parthvadhadiya424@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+
+[tool.poetry.dependencies]
+python = ">=3.11"
+openai = "^1.30.0"
+pydantic = "^2.11.4"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2.0"
+pytest-asyncio = "^0.23.7"
+black = "^24.4.2"
+ruff = "^0.4.4"
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
