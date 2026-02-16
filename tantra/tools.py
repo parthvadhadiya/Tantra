@@ -26,18 +26,18 @@ def generate_tool_schema(func: Callable, name: str = None, description: str = No
         OpenAI tool schema
 
     Example:
-        >>> async def fetch_news(cve_id: str, limit: int = 5) -> dict:
-        ...     '''Fetch news articles about a CVE.
+        >>> async def fetch_articles(topic: str, limit: int = 5) -> dict:
+        ...     '''Fetch articles about a topic.
         ...
         ...     Args:
-        ...         cve_id: The CVE identifier (e.g., CVE-2025-1234)
+        ...         topic: The topic to search for (e.g., "quantum computing")
         ...         limit: Maximum number of articles to return
         ...     '''
         ...     return {"articles": []}
         >>>
-        >>> schema = generate_tool_schema(fetch_news)
+        >>> schema = generate_tool_schema(fetch_articles)
         >>> schema['function']['name']
-        'fetch_news'
+        'fetch_articles'
     """
     sig = inspect.signature(func)
     type_hints = get_type_hints(func)

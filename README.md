@@ -382,7 +382,7 @@ Unlike heavy frameworks, Tantra doesn't hide what's happening:
 
 ```python
 # After running an agent, you can see everything:
-response = await agent.run("Research CVE-2025-1234")
+response = await agent.run("Research quantum computing applications")
 
 # Full conversation including tool calls
 for msg in response['messages']:

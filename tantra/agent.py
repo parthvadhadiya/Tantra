@@ -25,13 +25,13 @@ class Agent:
 
     Example:
         >>> agent = Agent(
-        ...     name="CVE_Researcher",
-        ...     system_message="You are a CVE research agent...",
-        ...     tools=[fetch_news, fetch_cve_data],
+        ...     name="Research_Agent",
+        ...     system_message="You are a helpful research agent...",
+        ...     tools=[fetch_data, search_articles],
         ...     model="gpt-4o"
         ... )
         >>>
-        >>> response = await agent.run("Research CVE-2025-1234")
+        >>> response = await agent.run("Research quantum computing")
         >>> print(response['content'])
         
     Multi-Agent Example:
