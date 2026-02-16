@@ -1,311 +1,477 @@
-from typing import Any, Dict, Optional, AsyncGenerator, Union
-import inspect
-import asyncio
-from abc import ABC
+"""
+Base Agent class for LLM function calling.
+"""
+import copy
+import json
+import logging
+from typing import Any, Callable, Optional
 
-from .llm import LLMFactory, LLMConfig
-from .memory import Memory
-from .tools import ToolRegistry
-from .session import Session
-from .config import AgentConfig
-from .utils.logger import logger
+from .providers import LLMProvider, OpenAIProvider
+from .types import (
+    AgentConfig, AgentResponse, Message, Tool,
+    AsyncToolFunction, SyncToolFunction
+)
+from .tools import generate_tool_schema, execute_tool, format_tool_result
 
-class Agent(ABC):
-    def __init__(self, config: Union[AgentConfig, Dict[str, Any]]):
-        if isinstance(config, dict):
-            self.config = AgentConfig.from_dict(config)
-        else:
-            self.config = config
-            
-        # Initialize LLM
-        llm_config = LLMConfig(
-            provider=self.config.llm_type,
-            model=self.config.llm_model,
-            api_key=self.config.llm_api_key,
-            **self.config.llm_options
-        )
-        self.llm = LLMFactory.create(llm_config)
-        
-        # Initialize other components
-        self.session: Optional[Session] = None
-        self.memory = Memory.load(self.config.memory_path) if self.config.memory_path else Memory()
-        self.tools = ToolRegistry()
-        
-        # Add basic facts to memory
-        self.memory.add_fact("agent_name", self.config.name)
-        self.memory.add_fact("agent_instructions", self.config.instructions)
-        
-    @property
-    def name(self) -> str:
-        return self.config.name
-        
-    @property
-    def instructions(self) -> str:
-        return self.config.instructions
-        
-    async def on_enter(self) -> Optional[str]:
-        """Called when agent starts a new session.
-        Return a string to send an initial message, or None for no message."""
-        return f"Hello! I am {self.name}. How can I help you today?"
-    
-    async def on_exit(self) -> Optional[str]:
-        """Called when agent ends a session.
-        Return a string to send a farewell message, or None for no message."""
-        return "Thank you for your time. Have a great day!"
-        
-    async def on_error(self, error: Exception) -> Optional[str]:
-        """Called when an error occurs.
-        Return a string to send an error message, or None for no message."""
-        return "I apologize, but I encountered an error. Please try again."
-        
-    async def on_timeout(self) -> Optional[str]:
-        """Called when a response times out.
-        Return a string to send a timeout message, or None for no message."""
-        return "I apologize, but I took too long to respond. Please try again."
-        
-    async def on_invalid_input(self, input_str: str) -> Optional[str]:
-        """Called when input validation fails.
-        Return a string to send an error message, or None for no message."""
-        return "I'm sorry, but I couldn't understand that input. Could you try again?"
-    
-    def register_tool(self, func):
-        """Register a new tool"""
-        self.tools.register(func)
-        
-    async def execute_tool(self, tool_name: str, **kwargs) -> Any:
-        """Execute a registered tool"""
-        tool_func = self.tools.get_tool(tool_name)
-        if not tool_func:
-            raise ValueError(f"Unknown tool: {tool_name}")
-        return await tool_func(**kwargs)
-    
-    async def think(self, message: str) -> str:
-        """Process a message and return a response"""
-        # Add message to memory only if it's not a duplicate
-        last_message = self.memory.messages[-1] if self.memory.messages else None
-        if not last_message or last_message['content'] != message:
-            self.memory.add_message("user", message)
-        
-        # Build prompt
-        logger.debug("Building prompt with:")
-        context = self.memory.get_context()
-        logger.debug(f"Context: {context}")
-        
-        tools = self.tools.get_tool_descriptions()
-        logger.debug(f"Available tools: {tools}")
-        
-        logger.debug(f"User message: {message}")
-        
-        # Get current tool and parameters if any
-        current_tool = self.memory.get_fact("current_tool")
-        current_params = {}
-        if current_tool:
-            current_params = self.memory.get_collected_params(current_tool)
-            logger.debug(f"Current tool: {current_tool} with params: {current_params}")
-        
-        param_state = f'Currently collecting parameters for: {current_tool}\nCollected so far: {current_params}' if current_tool else 'No active parameter collection'
-        
-        prompt = f"""You are an AI assistant that uses tools to help users. Follow these rules:
+logger = logging.getLogger(__name__)
 
-1. When you have ACTUAL values for ALL required parameters:
-   - Use the tool immediately with collected values
-   - Example: @set_reminder(task='buy groceries', time='tomorrow at 2pm')
 
-2. When you DON'T have all required values:
-   - Ask for ONLY ONE missing parameter at a time
-   - Ask in a natural way: "What task would you like to be reminded about?"
-   - Never ask for parameters you already have
-   - Never use placeholder values like 'task' or 'time'
+class Agent:
+    """
+    Base agent class for LLM function calling with multi-agent support.
 
-3. Parameter Collection State:
-   {param_state}
+    Provides transparent, controlled execution of LLM with tools.
+    No framework magic - full visibility into every request and response.
 
-Available Tools:
-{tools}
-
-Previous Context:
-{context}
-
-User: {message}
-
-Assistant (ask for ONE missing parameter OR use @tool with collected values):"""
+    Example:
+        >>> agent = Agent(
+        ...     name="CVE_Researcher",
+        ...     system_message="You are a CVE research agent...",
+        ...     tools=[fetch_news, fetch_cve_data],
+        ...     model="gpt-4o"
+        ... )
+        >>>
+        >>> response = await agent.run("Research CVE-2025-1234")
+        >>> print(response['content'])
         
-        logger.debug(f"Generated prompt:\n{prompt}")
-        
-        # Get response from LLM
-        response = await self.llm.chat(prompt)
-        logger.debug(f"LLM response: {response}")
-        
-        return response
+    Multi-Agent Example:
+        >>> researcher = Agent(name="Researcher", ...)
+        >>> writer = Agent(name="Writer", ...)
+        >>> coordinator = Agent(
+        ...     name="Coordinator",
+        ...     tools=[researcher.as_tool(), writer.as_tool()]
+        ... )
+    """
 
-    
-    async def stream_response(self, response: str) -> AsyncGenerator[str, None]:
-        """Stream response to user"""
-        if not self.config.streaming:
-            yield response
-            return
-            
-        self.memory.add_message("assistant", response)
-        words = response.split()
-        for i in range(0, len(words), 3):
-            chunk = " ".join(words[i:i+3])
-            yield chunk
-            await asyncio.sleep(0.1)
-            
-    async def say(self, message: str) -> None:
-        """Send a direct message without generation"""
-        if not self.session:
-            raise RuntimeError("No active session")
-            
-        self.memory.add_message("assistant", message)
-        if self.config.streaming:
-            async for chunk in self.stream_response(message):
-                await self.session.say(chunk)
-        else:
-            await self.session.say(message)
-    
-    async def generate(self, prompt: str) -> str:
-        """Generate a response using the agent's LLM"""
-        self.memory.add_message("user", prompt)
-        response = await self.think(prompt)
+    def __init__(
+        self,
+        name: str,
+        system_message: str,
+        tools: Optional[list[Callable]] = None,
+        model: str = "gpt-4o",
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
+        max_iterations: int = 20,
+        tool_choice: str = "auto",
+        truncate_tool_results: bool = True,
+        provider: Optional[LLMProvider] = None,
+        api_key: Optional[str] = None
+    ):
+        """
+        Initialize agent.
+
+        Args:
+            name: Agent name (for logging/observability)
+            system_message: System prompt defining agent behavior
+            tools: List of tool functions (sync or async) or other agents
+            model: LLM model to use (e.g., "gpt-4o", "gpt-4-turbo")
+            temperature: Sampling temperature (0.0 = deterministic)
+            max_tokens: Max tokens in response (None = no limit)
+            max_iterations: Max tool-calling iterations to prevent loops
+            tool_choice: "auto", "required", or "none"
+            truncate_tool_results: Whether to truncate large tool results (default: True)
+            provider: LLM provider instance (defaults to OpenAI)
+            api_key: API key for default provider (optional, uses env var if not provided)
+        """
+        self.name = name
+        self.system_message = system_message
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.max_iterations = max_iterations
+        self.tool_choice = tool_choice
+        self.truncate_tool_results = truncate_tool_results
+
+        # Initialize provider
+        self.provider = provider if provider is not None else OpenAIProvider(api_key=api_key)
+
+        # Process tools
+        self.tools = tools or []
+        self.tool_map: dict[str, Callable] = {}  # Will be populated during schema generation
+        self.tool_schemas = self._generate_tool_schemas()
+
+        # Conversation history
+        self.messages: list[Message] = []
         
-        if response.startswith("@"):
+        # Usage tracking
+        self.total_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
+
+    def _generate_tool_schemas(self) -> list[Tool]:
+        """Generate OpenAI tool schemas from tool functions."""
+        schemas = []
+        for tool in self.tools:
             try:
-                # Parse tool call
-                tool_call = response[1:].split("(")
-                tool_name = tool_call[0]
-                args_str = tool_call[1].rstrip(')')
-                logger.debug(f"Parsed tool call: {tool_name}({args_str})")
-                
-                # Get tool
-                if tool_name not in self.tools._tools:
-                    raise ValueError(f"Unknown tool: {tool_name}")
-                tool = self.tools._tools[tool_name]
-                
-                # Parse provided args
-                args = {}
-                if args_str:
-                    # TODO: Use safer parsing in production
-                    args = eval(f"dict({args_str})")
-                logger.debug(f"Parsed args: {args}")
-                
-                # Get any previously collected parameters
-                collected = self.memory.get_collected_params(tool_name)
-                args.update(collected)  # Add collected params to current args
-                logger.debug(f"Combined with collected params: {args}")
-                
-                # Analyze required parameters
-                required_params = []
-                param_info = {}
-                for name, param in tool.signature.parameters.items():
-                    if name == 'self':
-                        continue
-                    
-                    # Get parameter metadata
-                    param_type = param.annotation.__name__ if param.annotation != inspect._empty else 'Any'
-                    has_default = param.default != inspect._empty
-                    default_value = param.default if has_default else None
-                    
-                    param_info[name] = {
-                        'type': param_type,
-                        'required': not has_default,
-                        'default': default_value
-                    }
-                    
-                    if not has_default:
-                        required_params.append(name)
-                
-                logger.debug(f"Required parameters: {required_params}")
-                logger.debug(f"Parameter info: {param_info}")
-                
-                # Check for missing required params
-                missing_params = [p for p in required_params if p not in args]
-                if missing_params:
-                    logger.debug(f"Missing parameters: {missing_params}")
-                    
-                    # Save any new parameters
-                    for param, value in args.items():
-                        if param not in collected:
-                            logger.debug(f"Adding new parameter: {param}={value}")
-                            self.memory.add_param(tool_name, param, value)
-                    
-                    # Get docstring and param descriptions
-                    docstring = tool.description
-                    missing_info = []
-                    for param in missing_params:
-                        info = param_info[param]
-                        type_str = info['type']
-                        missing_info.append(f"{param} ({type_str})")
-                    
-                    # Ask for missing params
-                    prompt = f"""I need more information to use the {tool_name} tool.
-                    Missing required parameters: {', '.join(missing_info)}
-                    
-                    Tool description: {docstring}
-                    Already collected: {', '.join(f'{k}={v}' for k, v in collected.items())}
-                    
-                    Please ask the user for the {missing_params[0]} parameter in a natural way.
-                    Do not ask for any other parameters.
-                    """
-                    logger.debug(f"Asking for missing params with prompt:\n{prompt}")
-                    return await self.think(prompt)
-                
-                # All required params present, execute tool
-                logger.debug(f"Executing {tool_name} with args: {args}")
-                result = await self.execute_tool(tool_name, **args)
-                logger.debug(f"Tool returned: {result}")
-                
-                # Clear collected params after successful execution
-                logger.debug(f"Clearing collected params for {tool_name}")
-                self.memory.clear_collected_params(tool_name)
-                
-                # Generate natural response
-                prompt = f"""Tool {tool_name} returned: {result}
-                Tool description: {tool.description}
-                
-                Please provide a natural response incorporating this information.
-                """
-                logger.debug(f"Generating natural response with prompt:\n{prompt}")
-                return await self.think(prompt)
-                
+                # Generate schema from raw function
+                schema = generate_tool_schema(tool)
+                self.tool_map[tool.__name__] = tool
+
+                schemas.append(schema)
+                logger.debug(f"Generated schema for tool: {schema['function']['name']}")
             except Exception as e:
-                logger.error(f"Error in generate: {str(e)}", exc_info=True)
-                return await self.on_error(e)
-            
-        return response
-            
-    async def on_event(self, event: Dict[str, Any]) -> Optional[str]:
-        """Handle incoming events"""
+                tool_name = getattr(tool, '__name__', 'unknown')
+                logger.error(f"Failed to generate schema for {tool_name}: {e}", exc_info=True)
+        return schemas
+
+    async def run(self, task: str, **kwargs) -> AgentResponse:
+        """
+        Run agent with given task.
+
+        Handles full conversation loop with tool calling until
+        agent returns final response or max iterations reached.
+
+        Args:
+            task: User task/prompt
+            **kwargs: Additional parameters to override defaults
+
+        Returns:
+            Agent response with content, messages, and metadata
+        """
+        # Initialize conversation
+        self.messages = [
+            {"role": "system", "content": self.system_message},
+            {"role": "user", "content": task}
+        ]
+
+        iteration = 0
+        tool_calls_made = []
+
         try:
-            if event["type"] == "USER_MESSAGE":
-                return await self.generate(event["content"])
-                
-            elif event["type"] == "SESSION_START":
-                message = await self.on_enter()
-                if message:
-                    await self.say(message)
-                    
-            elif event["type"] == "SESSION_END":
-                message = await self.on_exit()
-                if message:
-                    await self.say(message)
-                    
-            elif event["type"] == "TIMEOUT":
-                message = await self.on_timeout()
-                if message:
-                    await self.say(message)
-                    
-            elif event["type"] == "INVALID_INPUT":
-                message = await self.on_invalid_input(event.get("content", ""))
-                if message:
-                    await self.say(message)
-                    
+            while iteration < self.max_iterations:
+                iteration += 1
+                logger.info(f"[{self.name}] Iteration {iteration}/{self.max_iterations}")
+
+                # Call OpenAI API
+                response = await self._call_openai()
+
+                message = response.choices[0].message
+                finish_reason = response.choices[0].finish_reason
+
+                # Add assistant message to history
+                message_dict = self._message_to_dict(message)
+                self.messages.append(message_dict)
+
+                logger.debug(f"[{self.name}] Finish reason: {finish_reason}")
+
+                # If no tool calls, conversation is complete
+                if finish_reason == "stop" or not message.tool_calls:
+                    logger.info(f"[{self.name}] Completed in {iteration} iterations")
+                    return {
+                        "success": True,
+                        "content": message.content,
+                        "messages": self.messages,
+                        "tool_calls": tool_calls_made,
+                        "iterations": iteration,
+                        "usage": self.total_usage.copy(),
+                        "error": None
+                    }
+
+                # Execute tool calls
+                if message.tool_calls:
+                    await self._execute_tool_calls(message.tool_calls, tool_calls_made)
+
+            # Max iterations reached
+            logger.warning(f"[{self.name}] Max iterations ({self.max_iterations}) reached")
+            return {
+                "success": False,
+                "content": None,
+                "messages": self.messages,
+                "tool_calls": tool_calls_made,
+                "iterations": iteration,
+                "usage": self.total_usage.copy(),
+                "error": f"Max iterations ({self.max_iterations}) reached"
+            }
+
         except Exception as e:
-            message = await self.on_error(e)
-            if message:
-                await self.say(message)
-            raise
+            logger.error(f"[{self.name}] Error during execution: {e}", exc_info=True)
+            return {
+                "success": False,
+                "content": None,
+                "messages": self.messages,
+                "tool_calls": tool_calls_made,
+                "iterations": iteration,
+                "usage": self.total_usage.copy(),
+                "error": str(e)
+            }
+
+    async def _call_openai(self):
+        """Make API call to LLM provider."""
+        logger.debug(f"[{self.name}] Calling LLM: {self.model}")
+        
+        response = await self.provider.create_completion(
+            messages=self.messages,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            tools=self.tool_schemas if self.tool_schemas else None,
+            tool_choice=self.tool_choice
+        )
+        
+        # Track usage
+        if "usage" in response:
+            self.total_usage["prompt_tokens"] += response["usage"]["prompt_tokens"]
+            self.total_usage["completion_tokens"] += response["usage"]["completion_tokens"]
+            self.total_usage["total_tokens"] += response["usage"]["total_tokens"]
+        
+        # Convert standardized response back to OpenAI-like format for compatibility
+        class MessageObj:
+            def __init__(self, data):
+                self.role = data["role"]
+                self.content = data["content"]
+                self.tool_calls = None
+                if data.get("tool_calls"):
+                    self.tool_calls = []
+                    for tc in data["tool_calls"]:
+                        class ToolCall:
+                            def __init__(self, tc_data):
+                                self.id = tc_data["id"]
+                                self.type = tc_data["type"]
+                                class Function:
+                                    def __init__(self, func_data):
+                                        self.name = func_data["name"]
+                                        self.arguments = func_data["arguments"]
+                                self.function = Function(tc_data["function"])
+                        self.tool_calls.append(ToolCall(tc))
+        
+        class Choice:
+            def __init__(self, message_data, finish_reason):
+                self.message = MessageObj(message_data)
+                self.finish_reason = finish_reason
+        
+        class Response:
+            def __init__(self, data):
+                self.choices = [Choice(data["message"], data["finish_reason"])]
+        
+        return Response(response)
+
+    async def _execute_tool_calls(self, tool_calls, tool_calls_made: list):
+        """Execute all tool calls from assistant message in parallel."""
+        import asyncio
+
+        # Log all tools being executed
+        tool_names = [tc.function.name for tc in tool_calls]
+        if len(tool_calls) > 1:
+            logger.info(f"[{self.name}] Executing {len(tool_calls)} tools in parallel: {tool_names}")
+
+        # Prepare all tool executions
+        async def execute_single_tool(tool_call):
+            tool_name = tool_call.function.name
+            tool_args_str = tool_call.function.arguments
+
+            try:
+                tool_args = json.loads(tool_args_str)
+            except json.JSONDecodeError as e:
+                logger.error(f"[{self.name}] Invalid tool arguments JSON: {e}")
+                tool_args = {}
+
+            logger.info(f"[{self.name}] Executing tool: {tool_name}({list(tool_args.keys())})")
+
+            # Execute tool
+            result = await execute_tool(tool_name, tool_args, self.tool_map)
+
+            logger.debug(f"[{self.name}] Tool {tool_name} completed: success={result['success']}")
+
+            return (tool_call, tool_name, tool_args, result)
+
+        # Execute all tool calls in parallel
+        results = await asyncio.gather(*[execute_single_tool(tc) for tc in tool_calls])
+
+        # Process results sequentially to maintain message order
+        for tool_call, tool_name, tool_args, result in results:
+            # Track tool call
+            tool_calls_made.append({
+                "tool": tool_name,
+                "arguments": tool_args,
+                "success": result["success"],
+                "error": result["error"]
+            })
+
+            # Format result for chat
+            if result["success"]:
+                # Use truncation only if enabled (for agents that need to stay within context limits)
+                # Impact/Enrich agents disable truncation so pipeline can access full tool responses
+                if self.truncate_tool_results:
+                    content = format_tool_result(result["result"], max_length=50000)
+                else:
+                    content = format_tool_result(result["result"], max_length=None)  # No truncation
+            else:
+                content = json.dumps({"error": result["error"]})
+
+            # Add tool result to conversation
+            self.messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "name": tool_name,
+                "content": content
+            })
+
+    @staticmethod
+    def _message_to_dict(message) -> Message:
+        """Convert OpenAI message object to dictionary."""
+        msg_dict: Message = {"role": message.role}
+
+        if message.content:
+            msg_dict["content"] = message.content
+
+        if hasattr(message, 'tool_calls') and message.tool_calls:
+            msg_dict["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }
+                }
+                for tc in message.tool_calls
+            ]
+
+        return msg_dict
+
+    def reset(self):
+        """Reset conversation history."""
+        self.messages = []
+        logger.debug(f"[{self.name}] Conversation history reset")
+
+    def get_messages(self) -> list[Message]:
+        """Get current conversation history."""
+        return self.messages.copy()
+
+    def add_user_message(self, content: str):
+        """Add a user message to conversation."""
+        self.messages.append({"role": "user", "content": content})
+
+    def get_last_response(self) -> Optional[str]:
+        """Get the last assistant response."""
+        for msg in reversed(self.messages):
+            if msg["role"] == "assistant" and msg.get("content"):
+                return msg["content"]
+        return None
     
-    def attach_session(self, session: Session):
-        """Attach a session to this agent"""
-        self.session = session
+    def fork(self) -> "Agent":
+        """
+        Create a fork of this agent with copied conversation state.
+        
+        Useful for exploring multiple conversation paths in multi-agent systems.
+        The forked agent has a deep copy of messages but shares tools and configuration.
+        
+        Returns:
+            New Agent instance with copied state
+            
+        Example:
+            >>> agent = Agent(name="Analyst", ...)
+            >>> response1 = await agent.run("Analyze data")
+            >>> 
+            >>> # Fork to explore different paths
+            >>> fork1 = agent.fork()
+            >>> fork2 = agent.fork()
+            >>> 
+            >>> result1 = await fork1.run("Approach A")
+            >>> result2 = await fork2.run("Approach B")
+        """
+        forked = Agent(
+            name=f"{self.name}_fork",
+            system_message=self.system_message,
+            tools=self.tools.copy(),
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            max_iterations=self.max_iterations,
+            tool_choice=self.tool_choice,
+            truncate_tool_results=self.truncate_tool_results,
+            provider=self.provider  # Share the same provider
+        )
+        
+        # Deep copy messages and tool map
+        forked.messages = copy.deepcopy(self.messages)
+        forked.tool_map = self.tool_map.copy()
+        forked.tool_schemas = self.tool_schemas.copy()
+        
+        logger.debug(f"[{self.name}] Created fork with {len(self.messages)} messages")
+        
+        return forked
+    
+    def as_tool(self, description: Optional[str] = None) -> Callable:
+        """
+        Convert this agent into a tool that can be used by other agents.
+        
+        Enables multi-agent coordination where one agent can delegate tasks
+        to specialized sub-agents.
+        
+        Args:
+            description: Optional custom description for the tool.
+                        If not provided, uses the agent's system message.
+        
+        Returns:
+            Async function that can be used as a tool by other agents
+            
+        Example:
+            >>> researcher = Agent(
+            ...     name="Researcher",
+            ...     system_message="You research topics and provide detailed analysis."
+            ... )
+            >>> 
+            >>> writer = Agent(
+            ...     name="Writer",
+            ...     system_message="You write engaging articles."
+            ... )
+            >>> 
+            >>> coordinator = Agent(
+            ...     name="Coordinator",
+            ...     system_message="You coordinate research and writing tasks.",
+            ...     tools=[researcher.as_tool(), writer.as_tool()]
+            ... )
+            >>> 
+            >>> result = await coordinator.run("Write an article about AI")
+        """
+        agent = self
+        tool_description = description or self.system_message.split('.')[0]
+        
+        async def agent_tool(task: str) -> dict:
+            # Create a clean description from docstring
+            nonlocal tool_description
+            return tool_description
+        
+        # Set proper function metadata for schema generation
+        agent_tool.__name__ = self.name.lower().replace(' ', '_')
+        agent_tool.__doc__ = f"""
+        Delegate task to {self.name} agent.
+        
+        {tool_description}
+        
+        Args:
+            task: The task or question to delegate to the {self.name} agent
+            
+        Returns:
+            Agent's response as a dictionary with the result
+        """
+        
+        # Wrap the actual agent execution
+        async def wrapped_agent_tool(task: str) -> dict:
+            logger.info(f"[{agent.name}] Invoked as tool with task: {task[:100]}...")
+            
+            # Create a fork to avoid polluting the original agent's conversation
+            forked_agent = agent.fork()
+            response = await forked_agent.run(task)
+            
+            if response["success"]:
+                return {
+                    "status": "success",
+                    "result": response["content"],
+                    "agent": agent.name
+                }
+            else:
+                return {
+                    "status": "error",
+                    "error": response["error"],
+                    "agent": agent.name
+                }
+        
+        # Copy metadata for schema generation
+        wrapped_agent_tool.__name__ = agent_tool.__name__
+        wrapped_agent_tool.__doc__ = agent_tool.__doc__
+        
+        return wrapped_agent_tool

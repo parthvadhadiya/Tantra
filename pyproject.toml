@@ -1,25 +1,55 @@
-[project]
+[tool.poetry]
 name = "tantra"
 version = "0.1.0"
-description = ""
-authors = [
-    {name = "parthvadhadiya",email = "parthvadhadiya424@gmail.com"}
-]
+description = "Transparent LLM agent patterns - installable or vendorable reference implementation for building multi-agent systems"
+authors = ["AxlNet <noreply@axlnet.ai>"]
 readme = "README.md"
-requires-python = ">=3.11"
+license = "MIT"
+homepage = "https://github.com/axlnet/tantra"
+repository = "https://github.com/axlnet/tantra"
+keywords = ["llm", "ai", "agents", "openai", "multi-agent", "transparent", "vendorable", "patterns"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+packages = [{include = "tantra"}]
 
 [tool.poetry.dependencies]
-python = ">=3.11"
-openai = "^1.30.0"
-pydantic = "^2.11.4"
+python = "^3.11"
+openai = "^1.0.0"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.2.0"
-pytest-asyncio = "^0.23.7"
-black = "^24.4.2"
-ruff = "^0.4.4"
-
+pytest = "^7.0.0"
+pytest-asyncio = "^0.21.0"
+black = "^23.0.0"
+mypy = "^1.0.0"
+ruff = "^0.1.0"
 
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
+requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ['py311', 'py312']
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "W"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
